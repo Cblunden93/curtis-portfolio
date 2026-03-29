@@ -1,8 +1,12 @@
 """
 Seek Job Scraper
+Searches seek.com.au for product roles across Queensland and Remote Australia.
+
 Usage:
-    python seek_scraper.py --keywords "python developer" --location "melbourne" --pages 2
-    python seek_scraper.py --keywords "data engineer" --location "sydney" --output jobs.json
+    python seek_scraper.py
+    python seek_scraper.py --pages 3
+    python seek_scraper.py --output jobs.json
+    python seek_scraper.py --keywords "Product Owner" "Product Manager" --pages 2
 
 Install dependencies:
     pip install -r requirements.txt
@@ -13,18 +17,35 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Optional
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
+DEFAULT_KEYWORDS = [
+    "Product Owner",
+    "Product Manager",
+    "Senior Product Owner",
+    "Product Analyst",
+]
 
-def build_url(keywords: str, location: str, page: int) -> str:
+# Each location entry: (label, url_path, extra_params)
+# Seek worktype=4 = Work from home / remote
+LOCATIONS = [
+    ("Queensland", "All-Queensland", ""),
+    ("Remote (Australia)", "All-Australia", "worktype=4"),
+]
+
+
+def build_url(keywords: str, location_path: str, extra_params: str, page: int) -> str:
     slug = keywords.strip().lower().replace(" ", "-")
-    loc = location.strip().lower().replace(" ", "-")
-    url = f"https://www.seek.com.au/{slug}-jobs/in-{loc}"
+    url = f"https://www.seek.com.au/{slug}-jobs/in-{location_path}"
+    params = []
+    if extra_params:
+        params.append(extra_params)
     if page > 1:
-        url += f"?page={page}"
+        params.append(f"page={page}")
+    if params:
+        url += "?" + "&".join(params)
     return url
 
 
@@ -61,7 +82,37 @@ def parse_jobs(html: str) -> list[dict]:
     return jobs
 
 
-async def scrape(keywords: str, location: str, pages: int) -> list[dict]:
+async def scrape_search(page, keywords: str, loc_label: str, loc_path: str, extra_params: str, pages: int) -> list[dict]:
+    results = []
+    for page_num in range(1, pages + 1):
+        url = build_url(keywords, loc_path, extra_params, page_num)
+        print(f"  [{loc_label}] page {page_num}: {url}", file=sys.stderr)
+
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_selector(
+                "article[data-card-type='JobCard']",
+                timeout=15000,
+            )
+        except Exception as e:
+            print(f"  Warning: no results or timeout — {e}", file=sys.stderr)
+            break
+
+        html = await page.content()
+        jobs = parse_jobs(html)
+
+        if not jobs:
+            print(f"  No jobs on page {page_num}, stopping.", file=sys.stderr)
+            break
+
+        print(f"  Found {len(jobs)} jobs.", file=sys.stderr)
+        results.extend(jobs)
+
+    return results
+
+
+async def scrape(keywords_list: list[str], pages: int) -> list[dict]:
+    seen_urls: set[str] = set()
     all_jobs = []
 
     async with async_playwright() as p:
@@ -75,30 +126,17 @@ async def scrape(keywords: str, location: str, pages: int) -> list[dict]:
         )
         page = await context.new_page()
 
-        for page_num in range(1, pages + 1):
-            url = build_url(keywords, location, page_num)
-            print(f"Fetching page {page_num}: {url}", file=sys.stderr)
-
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-                # Wait for job cards to appear
-                await page.wait_for_selector(
-                    "article[data-card-type='JobCard']",
-                    timeout=15000,
-                )
-            except Exception as e:
-                print(f"Warning: page {page_num} timed out or had no results: {e}", file=sys.stderr)
-                break
-
-            html = await page.content()
-            jobs = parse_jobs(html)
-
-            if not jobs:
-                print(f"No jobs found on page {page_num}, stopping.", file=sys.stderr)
-                break
-
-            print(f"Found {len(jobs)} jobs on page {page_num}.", file=sys.stderr)
-            all_jobs.extend(jobs)
+        for keywords in keywords_list:
+            for loc_label, loc_path, extra_params in LOCATIONS:
+                print(f"\nSearching: '{keywords}' in {loc_label}", file=sys.stderr)
+                jobs = await scrape_search(page, keywords, loc_label, loc_path, extra_params, pages)
+                for job in jobs:
+                    url = job.get("url")
+                    if url and url in seen_urls:
+                        continue
+                    if url:
+                        seen_urls.add(url)
+                    all_jobs.append(job)
 
         await browser.close()
 
@@ -106,25 +144,29 @@ async def scrape(keywords: str, location: str, pages: int) -> list[dict]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape job listings from seek.com.au")
-    parser.add_argument("--keywords", required=True, help='Job keywords, e.g. "python developer"')
-    parser.add_argument("--location", required=True, help='Location, e.g. "melbourne"')
-    parser.add_argument("--pages", type=int, default=1, help="Number of pages to scrape (default: 1)")
+    parser = argparse.ArgumentParser(description="Scrape product role jobs from seek.com.au")
+    parser.add_argument(
+        "--keywords",
+        nargs="+",
+        default=DEFAULT_KEYWORDS,
+        help="One or more job keyword strings to search (default: product roles)",
+    )
+    parser.add_argument("--pages", type=int, default=1, help="Pages per search (default: 1)")
     parser.add_argument("--output", help="Write results to this JSON file instead of stdout")
     args = parser.parse_args()
 
-    jobs = asyncio.run(scrape(args.keywords, args.location, args.pages))
+    jobs = asyncio.run(scrape(args.keywords, args.pages))
 
     result = json.dumps(jobs, indent=2, ensure_ascii=False)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(result)
-        print(f"Wrote {len(jobs)} jobs to {args.output}", file=sys.stderr)
+        print(f"\nWrote {len(jobs)} jobs to {args.output}", file=sys.stderr)
     else:
         print(result)
 
-    print(f"\nTotal jobs scraped: {len(jobs)}", file=sys.stderr)
+    print(f"\nTotal unique jobs scraped: {len(jobs)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
